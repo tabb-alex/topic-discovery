@@ -8,6 +8,8 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 import hdbscan
 
+from nltk.corpus import wordnet as wn
+
 
 class TopicBuilder:
 
@@ -29,6 +31,86 @@ class TopicBuilder:
         self.synset_embeddings = synset_embeddings.copy()
         self._build_graph()
 
+    def _candidate_lemmas(self, word: str) -> set[str]:
+        """
+        Return candidate base forms for a seed word.
+
+        Uses WordNet morphology when NLTK + corpus data are available.
+        Falls back to the lowercased surface form.
+        """
+        w = str(word).strip().lower()
+        if not w:
+            return set()
+
+        candidates = {w}
+        if wn is None:
+            return candidates
+
+        try:
+            for pos in (wn.NOUN, wn.VERB, wn.ADJ, wn.ADV):
+                lemma = wn.morphy(w, pos)
+                if lemma:
+                    candidates.add(lemma.lower())
+        except Exception:
+            # Keep behavior stable if nltk corpora are not available.
+            return candidates
+
+        return candidates
+
+    def _heuristic_base_forms(self, word: str) -> set[str]:
+        """
+        Cheap morphology fallback when WordNet lemmatization is unavailable.
+        """
+        w = str(word).strip().lower()
+        if not w:
+            return set()
+
+        forms = {w}
+        if len(w) > 4 and w.endswith("ies"):
+            forms.add(w[:-3] + "y")
+        if len(w) > 3 and w.endswith("s"):
+            forms.add(w[:-1])
+        if len(w) > 5 and w.endswith("ing"):
+            root = w[:-3]
+            forms.add(root)
+            forms.add(root + "e")
+        if len(w) > 4 and w.endswith("ed"):
+            root = w[:-2]
+            forms.add(root)
+            forms.add(root + "e")
+        return forms
+
+    def _expand_seed_words(
+        self,
+        seed_words: Sequence[str],
+        use_lemmatization: bool = True,
+    ) -> tuple[set[str], dict[str, set[str]]]:
+        """
+        Expand seed words to include candidate lemmas.
+
+        Returns:
+            expanded_words: all normalized forms used for lexical matching
+            per_seed_forms: mapping from original seed -> normalized forms
+        """
+        expanded_words: set[str] = set()
+        per_seed_forms: dict[str, set[str]] = {}
+        for w in seed_words:
+            w_norm = str(w).strip().lower()
+            if not w_norm:
+                continue
+
+            # Strict mode: exact lexical match only (case-insensitive).
+            if not use_lemmatization:
+                forms = {w_norm}
+            else:
+                forms = self._heuristic_base_forms(w_norm)
+                if use_lemmatization:
+                    forms |= self._candidate_lemmas(w_norm)
+            if forms:
+                per_seed_forms[str(w)] = forms
+                expanded_words |= forms
+        return expanded_words, per_seed_forms
+
 
     def _build_graph(self):
         """
@@ -48,6 +130,7 @@ class TopicBuilder:
         allowed_relations: Optional[set[str]] = None,
         max_degree: int = 30,
         decay: float = 0.7,
+        use_lemmatization: bool = True,
         return_results: bool = False):
         """
         Expand seed words into related synsets using graph traversal and score them.
@@ -59,6 +142,9 @@ class TopicBuilder:
             self.expanded_synsets: scored synsets
             self.selected_synsets: expanded synsets with embeddings
             self.missing_seed_words: seed words not found in WordNet
+
+        Args:
+            use_lemmatization: expand seed words with lemma candidates (WordNet + heuristics).
         """
         
 
@@ -75,14 +161,28 @@ class TopicBuilder:
     
         # Lexical mapping: seed_words -> synsets, with counts (lexical hits)
         df = self.synset_words_df.copy()
+        lemma_norm = df["lemma"].astype(str).str.strip().str.lower()
+        zlemma_norm = df["zlemma"].astype(str).str.strip().str.lower()
+        expanded_words, per_seed_forms = self._expand_seed_words(
+            seed_words,
+            use_lemmatization=use_lemmatization,
+        )
+        if not expanded_words:
+            raise ValueError("None of the provided seed words were recognized")
     
         mask = pd.Series(False, index=df.index)
-        matched_words = set()
+        matched_seed_words = set()
     
-        mask |= df["lemma"].isin(seed_words) | df["zlemma"].isin(seed_words)
-    
-        matched_words |= set(df.loc[mask, "lemma"].dropna().astype(str)) | set(df.loc[mask, "zlemma"].dropna().astype(str))
-        self.missing_seed_words = sorted(set(seed_words) - matched_words)
+        mask |= lemma_norm.isin(expanded_words) | zlemma_norm.isin(expanded_words)
+
+        matched_rows = df.loc[mask, ["lemma", "zlemma"]].copy()
+        matched_forms = set(matched_rows["lemma"].dropna().astype(str).str.strip().str.lower())
+        matched_forms |= set(matched_rows["zlemma"].dropna().astype(str).str.strip().str.lower())
+
+        for seed, forms in per_seed_forms.items():
+            if forms & matched_forms:
+                matched_seed_words.add(seed)
+        self.missing_seed_words = sorted(set(map(str, seed_words)) - matched_seed_words)
     
         seed_synsets_series = df.loc[mask, "synsetid"]
         if seed_synsets_series.empty:
