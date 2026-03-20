@@ -11,25 +11,171 @@ import hdbscan
 from nltk.corpus import wordnet as wn
 
 
+
 class TopicBuilder:
 
 
     def __init__(self,
-                synset_words_df: pd.DataFrame,
-                semlinks: pd.DataFrame,
-                synset_embeddings: pd.DataFrame):
+                synset_embeddings: pd.DataFrame,
+                languages: Optional[Sequence[str] | str] = None):
         """
-        Initialize the topic builder with WordNet mappings, semantic links, and embeddings.
-    
-        Expects:
-            synset_words_df: synset ↔ word mappings (lemma, zlemma)
-            semlinks: directed synset–synset relations
+        Initialize the topic builder from NLTK WordNet/OMW plus external embeddings.
+
+        Args:
             synset_embeddings: synset embeddings with one row per synset
+            languages: OMW language code(s) to load for lexical forms.
+                Examples: "eng", ["eng", "cmn", "spa"].
+                If None, defaults to ("eng", "cmn").
         """
-        self.synset_words_df = synset_words_df.copy()
-        self.semlinks = semlinks.copy()
         self.synset_embeddings = synset_embeddings.copy()
+        self.synset_words_df = self.build_synset_words_from_nltk(languages=self._normalize_languages(languages))
+        self.semlinks = self.build_semlinks_from_nltk()
+        self.lexicon_long = self._build_lexicon_long(self.synset_words_df)
+        self.available_languages = sorted(self.lexicon_long["lang"].dropna().astype(str).unique().tolist())
         self._build_graph()
+
+    @staticmethod
+    def _normalize_languages(languages: Optional[Sequence[str] | str]) -> Sequence[str]:
+        if languages is None:
+            return ("eng", "cmn")
+        if isinstance(languages, str):
+            return (languages.strip().lower(),)
+        return tuple(str(x).strip().lower() for x in languages)
+
+    @staticmethod
+    def _build_lexicon_long(synset_words_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize lexical mappings to long format: synsetid, lang, lemma.
+
+        Supported input schema:
+          synsetid, lang, lemma
+        """
+        cols = set(synset_words_df.columns)
+        if {"synsetid", "lang", "lemma"}.issubset(cols):
+            out = synset_words_df[["synsetid", "lang", "lemma"]].copy()
+            out = out[out["lemma"].notna()].reset_index(drop=True)
+            out["lang"] = out["lang"].astype(str).str.lower()
+            out["lemma"] = out["lemma"].astype(str)
+            return out
+
+        raise ValueError("synset_words_df must contain columns ('synsetid','lang','lemma').")
+
+    def _resolve_language_selection(self, language) -> list[str]:
+        """
+        Resolve legacy and modern language selectors into OMW language codes.
+        """
+        if language is None:
+            return list(self.available_languages)
+
+        if isinstance(language, str):
+            key = language.strip().lower()
+            if key == "both":
+                return list(self.available_languages)
+            if key == "en":
+                key = "eng"
+            elif key == "zh":
+                key = "cmn"
+            return [key]
+
+        out = []
+        for item in language:
+            key = str(item).strip().lower()
+            if key == "en":
+                key = "eng"
+            elif key == "zh":
+                key = "cmn"
+            out.append(key)
+        return out
+
+    @staticmethod
+    def _synset_to_id(syn) -> int:
+        """
+        Convert NLTK synset to SQL-style synset id:
+        n -> 1XXXXXXXX, v -> 2XXXXXXXX, a/s -> 3XXXXXXXX, r -> 4XXXXXXXX
+        """
+        pos_prefix = {"n": 1, "v": 2, "a": 3, "s": 3, "r": 4}[syn.pos()]
+        return pos_prefix * 100_000_000 + syn.offset()
+
+    @classmethod
+    def build_synset_words_from_nltk(cls, languages: Optional[Sequence[str]] = None) -> pd.DataFrame:
+        """
+        Build multilingual synset_words DataFrame from NLTK WordNet + OMW lemmas.
+
+        Returns long format columns: synsetid, lang, lemma.
+        """
+        if wn is None:
+            raise ImportError("nltk.wordnet is not available. Install nltk and WordNet corpora.")
+
+        if languages is None:
+            languages = ("eng", "cmn")
+
+        rows = []
+        for syn in wn.all_synsets():
+            sid = cls._synset_to_id(syn)
+            for lang in languages:
+                lemmas = syn.lemma_names(lang) or []
+                for lemma in lemmas:
+                    rows.append(
+                        {
+                            "synsetid": sid,
+                            "lang": str(lang).lower(),
+                            "lemma": str(lemma).replace("_", " "),
+                        }
+                    )
+
+        if not rows:
+            return pd.DataFrame(columns=["synsetid", "lang", "lemma"])
+
+        return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
+
+    @classmethod
+    def build_semlinks_from_nltk(cls) -> pd.DataFrame:
+        """
+        Build semlinks DataFrame from NLTK WordNet relations.
+        """
+        if wn is None:
+            raise ImportError("nltk.wordnet is not available. Install nltk and WordNet corpora.")
+
+        relation_methods = {
+            "hypernym": "hypernyms",
+            "hyponym": "hyponyms",
+            "instance_hypernym": "instance_hypernyms",
+            "instance_hyponym": "instance_hyponyms",
+            "member_holonym": "member_holonyms",
+            "substance_holonym": "substance_holonyms",
+            "part_holonym": "part_holonyms",
+            "member_meronym": "member_meronyms",
+            "substance_meronym": "substance_meronyms",
+            "part_meronym": "part_meronyms",
+            "topic_domain": "topic_domains",
+            "region_domain": "region_domains",
+            "usage_domain": "usage_domains",
+            "attribute": "attributes",
+            "entailment": "entailments",
+            "cause": "causes",
+            "also_see": "also_sees",
+            "verb_group": "verb_groups",
+            "similar_to": "similar_tos",
+        }
+
+        rows = []
+        for syn in wn.all_synsets():
+            src = cls._synset_to_id(syn)
+            for rel_name, method_name in relation_methods.items():
+                neighbors = getattr(syn, method_name)()
+                for nbr in neighbors:
+                    rows.append(
+                        {
+                            "synset1id": src,
+                            "synset2id": cls._synset_to_id(nbr),
+                            "link": rel_name,
+                        }
+                    )
+
+        if not rows:
+            return pd.DataFrame(columns=["synset1id", "synset2id", "link"])
+
+        return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
 
     def _candidate_lemmas(self, word: str) -> set[str]:
         """
@@ -130,6 +276,7 @@ class TopicBuilder:
         allowed_relations: Optional[set[str]] = None,
         max_degree: int = 30,
         decay: float = 0.7,
+        seed_languages = None,
         use_lemmatization: bool = True,
         return_results: bool = False):
         """
@@ -144,6 +291,8 @@ class TopicBuilder:
             self.missing_seed_words: seed words not found in WordNet
 
         Args:
+            seed_languages: OMW language code(s) used to map seeds to synsets.
+                Examples: "eng", "cmn", ["eng", "spa"], or None for all available.
             use_lemmatization: expand seed words with lemma candidates (WordNet + heuristics).
         """
         
@@ -152,17 +301,16 @@ class TopicBuilder:
             raise ValueError("decay must be in (0, 1].")
         if max_depth < 0:
             raise ValueError("max_depth must be >= 0.")
-        if "lemma" not in self.synset_words_df.columns:
-            raise ValueError("synset_words_df must contain column 'lemma' for language='en' or 'both'.")
-        if "zlemma" not in self.synset_words_df.columns:
-            raise ValueError("synset_words_df must contain column 'zlemma' for language='zh' or 'both'.")
         if allowed_relations is None:
             allowed_relations = set()
     
         # Lexical mapping: seed_words -> synsets, with counts (lexical hits)
-        df = self.synset_words_df.copy()
+        selected_langs = self._resolve_language_selection(seed_languages)
+        df = self.lexicon_long[self.lexicon_long["lang"].isin(selected_langs)].copy()
+        if df.empty:
+            raise ValueError(f"No lexical rows found for seed_languages={selected_langs}")
+
         lemma_norm = df["lemma"].astype(str).str.strip().str.lower()
-        zlemma_norm = df["zlemma"].astype(str).str.strip().str.lower()
         expanded_words, per_seed_forms = self._expand_seed_words(
             seed_words,
             use_lemmatization=use_lemmatization,
@@ -173,11 +321,10 @@ class TopicBuilder:
         mask = pd.Series(False, index=df.index)
         matched_seed_words = set()
     
-        mask |= lemma_norm.isin(expanded_words) | zlemma_norm.isin(expanded_words)
+        mask |= lemma_norm.isin(expanded_words)
 
-        matched_rows = df.loc[mask, ["lemma", "zlemma"]].copy()
+        matched_rows = df.loc[mask, ["lemma"]].copy()
         matched_forms = set(matched_rows["lemma"].dropna().astype(str).str.strip().str.lower())
-        matched_forms |= set(matched_rows["zlemma"].dropna().astype(str).str.strip().str.lower())
 
         for seed, forms in per_seed_forms.items():
             if forms & matched_forms:
@@ -521,21 +668,11 @@ class TopicBuilder:
                    .reset_index(drop=True)
         )
     
-        wdf = self.synset_words_df[["synsetid", "lemma", "zlemma"]].copy()
-        if language == 'both':
-            w_long = pd.concat(
-                [
-                    wdf[["synsetid", "lemma"]].rename(columns={"lemma": word_col}),
-                    wdf[["synsetid", "zlemma"]].rename(columns={"zlemma": word_col}),
-                ],
-                ignore_index=True,
-            )
-        elif language == 'zh':
-            w_long = wdf[["synsetid", "zlemma"]].rename(columns={"zlemma": word_col})
-        elif language == 'en':
-            w_long = wdf[["synsetid", "lemma"]].rename(columns={"lemma": word_col})
-        else:
-            raise ValueError(f"{language} is not a recognized language")
+        selected_langs = self._resolve_language_selection(language)
+        w_long = self.lexicon_long[self.lexicon_long["lang"].isin(selected_langs)][["synsetid", "lemma"]].copy()
+        if w_long.empty:
+            raise ValueError(f"No lexical rows found for language={selected_langs}")
+        w_long = w_long.rename(columns={"lemma": word_col})
         w_long = w_long[w_long[word_col].notna()]
         w_long[word_col] = w_long[word_col].astype(str)
     
