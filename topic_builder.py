@@ -404,7 +404,7 @@ class TopicBuilder:
 
     def get_centroids(
         self,
-        strategy = 'weighted_mean',
+        strategy = 'hdbscan',
         params = None
     ):
         """
